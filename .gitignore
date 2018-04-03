@@ -107,4 +107,6 @@ tox.ini
 *.sublime-workspace
 
 # Project data and experiment
+/data
+/experiments
 
