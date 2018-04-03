@@ -99,3 +99,12 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+# Sublime text and packages
+.remote-sync.json
+tox.ini
+*.sublime-project
+*.sublime-workspace
+
+# Project data and experiment
+
