@@ -110,3 +110,4 @@ tox.ini
 /data
 /experiments
 
+.DS_Store
