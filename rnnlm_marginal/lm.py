@@ -85,6 +85,7 @@ def create_rnnlm(opt, with_dropout=False):
         _rnn_input_size = opt['rnn_dim']
         _rnn_cells.append(_rnn_cell)
     final_cell = tf.nn.rnn_cell.MultiRNNCell(_rnn_cells)
+    rnn_cell = final_cell
 
     # state reset
     if opt['rnn_state_reset_prob'] > 0 or opt['rnn_init_state_trainable']:
@@ -140,6 +141,42 @@ def create_rnnlm(opt, with_dropout=False):
     unigram_token_nll * token_weight_ph * seq_weight_ph
     sum_unigram_token_nll = tf.reduce_sum(unigram_token_nll)
     mean_unigram_token_nll = sum_unigram_token_nll / tf.reduce_sum(token_weight_ph)
+    # mean_token_nll = tf.Print(mean_token_nll, [mean_token_nll], 'll')
+    return {k: v for k, v in locals().items() if not k.startswith('_')}
+
+
+def create_marginal_rnnlm(lm):
+    ngram_token_ph = tfph(tf.int32, shape=[None, None], name='ngram_tokens')
+    ngram_logprob_ph = tfph(tf.float32, shape=[None], name='ngram_log_probs')
+    ngram_len_ph = tfph(tf.int32, shape=[None], name='ngram_lens')
+    ngram_token_weight_ph = tfph(
+        tf.float32, shape=[None, None], name='ngram_token_weights')
+    ngram_weight_ph = tfph(tf.float32, shape=[None], name='ngram_weights')
+    ngram_token_emb = tf.nn.embedding_lookup(lm['emb_var'], ngram_token_ph)
+    rnn_cell = lm['rnn_cell']
+    _input_shape = tf.shape(ngram_token_ph, out_type=tf.int32)
+    seq_len = _input_shape[0]
+    batch_size = _input_shape[1]
+    init_state = rnn_cell.zero_state(batch_size, tf.float32)
+    cell_output, final_state = tf.nn.dynamic_rnn(
+        rnn_cell, ngram_token_emb, sequence_length=ngram_len_ph-1,
+        initial_state=init_state,
+        dtype=tf.float32, time_major=True)
+    # XXX: 2-layer LSTM Cell
+    first_output = init_state[-1].h[tf.newaxis, :, :]
+    cell_output = tf.concat([first_output, cell_output[:-1, :, :]], 0)
+    logit = _matmul(cell_output, lm['logit_w_var'], transpose_b=True) + lm['logit_b_var']
+    token_nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        labels=ngram_token_ph, logits=logit)
+    token_nll = token_nll * ngram_token_weight_ph * ngram_weight_ph
+    ngram_logprob_model = -tf.reduce_sum(token_nll, axis=0)
+    ngram_prob_model = tf.exp(ngram_logprob_model)
+    # log_ratio = tf.stop_gradient(ngram_logprob_model - ngram_logprob_ph)
+    # ngram_loss = ngram_prob_model * log_ratio
+
+    ngram_loss = tf.squared_difference(ngram_logprob_model, ngram_logprob_ph) / 2
+    mean_ngram_loss = tf.reduce_mean(ngram_loss)
+    # mean_ngram_loss = tf.Print(mean_ngram_loss, [mean_ngram_loss], 'ngram')
     return {k: v for k, v in locals().items() if not k.startswith('_')}
 
 
@@ -276,6 +313,14 @@ def default_train_opt():
     }
 
 
+def _feed_lm(feed_dict, lm, batch):
+    feed_dict[lm['input_token_ph']] = batch.features.inputs
+    feed_dict[lm['seq_len_ph']] = batch.features.seq_len
+    feed_dict[lm['label_token_ph']] = batch.labels.label
+    feed_dict[lm['token_weight_ph']] = batch.labels.label_weight
+    feed_dict[lm['seq_weight_ph']] = batch.labels.seq_weight
+
+
 def _run_epoch(sess, model, batch_wrapper, *fetch, feed_dict=None):
     if len(fetch) == 0:
         raise ValueError('`fetch` needs to have at least one element.')
@@ -290,11 +335,7 @@ def _run_epoch(sess, model, batch_wrapper, *fetch, feed_dict=None):
         feed_dict = {}
     total_time = 0.0
     for batch in batch_wrapper.iter():
-        feed_dict[model['input_token_ph']] = batch.features.inputs
-        feed_dict[model['seq_len_ph']] = batch.features.seq_len
-        feed_dict[model['label_token_ph']] = batch.labels.label
-        feed_dict[model['token_weight_ph']] = batch.labels.label_weight
-        feed_dict[model['seq_weight_ph']] = batch.labels.seq_weight
+        _feed_lm(feed_dict, model, batch)
         if state is not None:
             feed_dict[model['init_state']] = state
         x = time.time()
@@ -394,3 +435,93 @@ def sample(sess, decoder, batch_size, checkpoint_path=None):
             [decoder['samples'], decoder['final_state']],
             {decoder['batch_size_ph']: batch_size, decoder['init_state']: state})
         yield samples
+
+
+def _feed_ngram_kl(feed_dict, mm, batch):
+    feed_dict[mm['ngram_token_ph']] = batch.features.inputs
+    feed_dict[mm['ngram_len_ph']] = batch.features.seq_len
+    feed_dict[mm['ngram_logprob_ph']] = batch.labels.label
+    feed_dict[mm['ngram_token_weight_ph']] = batch.labels.label_weight
+    feed_dict[mm['ngram_weight_ph']] = batch.labels.seq_weight
+
+
+def _run_epoch_ngram_kl(
+        sess, model, mar_model, batch_wrapper, ngram_batch_wrapper,
+        *fetch, feed_dict=None):
+    if len(fetch) == 0:
+        raise ValueError('`fetch` needs to have at least one element.')
+    state = None
+    if batch_wrapper.keep_state:
+        state = sess.run(
+            model['init_state'], {model['batch_size']: batch_wrapper.batch_size})
+        fetch = [fetch, model['final_state']]
+    else:
+        fetch = [fetch, tf.no_op()]
+    if feed_dict is None:
+        feed_dict = {}
+    total_time = 0.0
+    ngram_batches = ngram_batch_wrapper.iter()
+    for batch in batch_wrapper.iter():
+        ngram_batch = next(ngram_batches, None)
+        if ngram_batch is None:
+            ngram_batches = ngram_batch_wrapper.iter()
+            ngram_batch = next(ngram_batches, None)
+        _feed_lm(feed_dict, model, batch)
+        _feed_ngram_kl(feed_dict, mar_model, ngram_batch)
+        if state is not None:
+            feed_dict[model['init_state']] = state
+        x = time.time()
+        results, state = sess.run(fetch, feed_dict=feed_dict)
+        total_time += time.time() - x
+        yield results, batch
+
+
+def train_ngram_kl(
+        opt, sess, train_model, optim_op, learning_rate, train_batches,
+        eval_model, valid_batches, logger,
+        mar_model, ngram_batch_wrapper,
+        report_key='mean_token_nll', report_exp=True):
+    checkpoint_path = opt['checkpoint_path']
+    best_saver = tf.train.Saver(var_list=tf.trainable_variables())
+    latest_saver = tf.train.Saver(var_list=tf.trainable_variables())
+    best_loss = float('inf')
+    steps = 0
+    for epoch in range(opt['max_epochs']):
+        # train
+        ep_train_loss = 0.0
+        ep_train_num_tokens = 0
+        ep_steps = 0
+        _start_time = time.time()
+        for results, batch in _run_epoch_ngram_kl(
+                sess, train_model, mar_model, train_batches, ngram_batch_wrapper,
+                optim_op, train_model[report_key], learning_rate):
+            ep_train_loss += results[1] * batch.num_tokens
+            ep_train_num_tokens += batch.num_tokens
+            steps += 1
+            ep_steps += 1
+        avg_ep_train_loss = ep_train_loss / ep_train_num_tokens
+        train_loss = avg_ep_train_loss
+        if report_exp:
+            train_loss = np.exp(avg_ep_train_loss)
+        _seconds = time.time() - _start_time
+        logger.info(
+            f'{epoch + 1}: train {train_loss:.5f}, lr {results[2]:.5f}, '
+            f'{ep_steps} steps in {_seconds:.1f}s')
+        # valid
+        ep_valid_loss = 0.0
+        ep_valid_num_tokens = 0
+        for results, batch in _run_epoch(
+                sess, eval_model, valid_batches, eval_model[report_key]):
+            ep_valid_loss += results[0] * batch.num_tokens
+            ep_valid_num_tokens += batch.num_tokens
+        avg_ep_valid_loss = ep_valid_loss / ep_valid_num_tokens
+        valid_loss = avg_ep_valid_loss
+        if report_exp:
+            valid_loss = np.exp(avg_ep_valid_loss)
+        logger.info(f'{epoch + 1}: valid {valid_loss:.5f}')
+        if avg_ep_valid_loss < best_loss:
+            avg_ep_valid_loss = best_loss
+            best_saver.save(sess, f'{checkpoint_path}/best')
+        latest_saver.save(sess, f'{checkpoint_path}/latest')
+
+

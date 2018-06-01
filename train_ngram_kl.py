@@ -44,6 +44,7 @@ def ptb_opt():
         }, lm.default_rnnlm_opt())
     train_opt = ChainMap({
         'loss_key': 'mean_token_nll',  # or sum_token_nll
+        'ngram_loss_coeff': 0.1,
         'init_learning_rate': 0.003,
         'decay_rate': 0.9,
         'staircase': True,
@@ -87,49 +88,7 @@ def wt2_opt():
         }, lm.default_rnnlm_opt())
     train_opt = ChainMap({
         'loss_key': 'mean_token_nll',  # or sum_token_nll
-        'init_learning_rate': 0.003,
-        'decay_rate': 0.85,
-        'staircase': True,
-        'optim': 'tensorflow.train.AdamOptimizer',
-        # if adam
-        'optim_beta1': 0.0,
-        'optim_beta2': 0.999,
-        'optim_epsilon': 1e-8,
-        # fi
-        'clip_gradients': 5.0,
-        'max_epochs': 40,
-        'checkpoint_path': 'tmp',  # auto to exp_dir
-        'decay_steps': -1  # if -1 auto to an epoch
-        }, lm.default_train_opt())
-    return reader_opt, model_opt, train_opt
-
-
-def cnndm_opt():
-    reader_opt = ChainMap({
-        'sentences': True,
-        # if sentences is False
-        'min_seq_len': 35,
-        'max_seq_len': 35,
-        # fi
-        'shuffle': False,
-        'batch_size': 20,
-        'vocab_path': '',  # auto to data
-        'text_path': ''  # auto to data
-        }, reader.default_reader_opt())
-    model_opt = ChainMap({
-        'emb_dim': 650,
-        'rnn_dim': 650,
-        'rnn_layers': 2,
-        'rnn_variational': True,
-        'rnn_input_keep_prob': 0.5,
-        'rnn_layer_keep_prob': 0.7,
-        'rnn_output_keep_prob': 0.5,
-        'rnn_state_keep_prob': 0.7,
-        'logit_weight_tying': True,
-        'vocab_size': -1  # auto to data
-        }, lm.default_rnnlm_opt())
-    train_opt = ChainMap({
-        'loss_key': 'mean_token_nll',  # or sum_token_nll
+        'ngram_loss_coeff': 0.1,
         'init_learning_rate': 0.003,
         'decay_rate': 0.85,
         'staircase': True,
@@ -149,6 +108,7 @@ def cnndm_opt():
 
 parser = argparse.ArgumentParser()
 parser.add_argument('data_dir', type=str)
+parser.add_argument('prior_filepath', type=str)
 parser.add_argument('exp_dir', type=str)
 parser.add_argument('--log_level', type=str, default='info')
 parser.add_argument('--delete', action='store_true')
@@ -163,8 +123,6 @@ if 'ptb' in args['data_dir']:
     reader_opt, model_opt, train_opt = ptb_opt()
 elif 'wikitext-2' in args['data_dir']:
     reader_opt, model_opt, train_opt = wt2_opt()
-elif 'cnndm' in args['data_dir']:
-    reader_opt, model_opt, train_opt = cnndm_opt()
 else:
     raise ValueError('ptb or wikitext-2')
 
@@ -180,6 +138,13 @@ train_iter_wrapper = reader.get_batch_iter_from_file(reader_opt)
 reader_opt['text_path'] = data_path('valid.txt')
 valid_iter_wrapper = reader.get_batch_iter_from_file(
     reader_opt, train_iter_wrapper.vocab)
+ngram_reader_opt = dict(reader_opt)
+ngram_reader_opt['text_path'] = args['prior_filepath']
+ngram_reader_opt['ngrams'] = True
+ngram_reader_opt['batch_size'] = 128  # 512 for wikitext-103
+ngram_reader_opt['shuffle'] = True
+ngram_iter_wrapper = reader.get_batch_iter_from_file(
+    ngram_reader_opt, train_iter_wrapper.vocab)
 
 # creating models
 model_opt['vocab_size'] = train_iter_wrapper.vocab.vocab_size
@@ -189,11 +154,14 @@ if args['reset_state']:
 with tf.variable_scope('model'):
     train_model = lm.create_rnnlm(model_opt, with_dropout=True)
 with tf.variable_scope('model', reuse=True):
+    marginal_model = lm.create_marginal_rnnlm(train_model)
     eval_model = lm.create_rnnlm(model_opt, with_dropout=False)
+
 if train_opt['decay_steps'] == -1:
     train_opt['decay_steps'] = train_iter_wrapper.num_batches
 train_opt['checkpoint_path'] = exp_path('checkpoint')
 optim_obj = train_model[train_opt['loss_key']]
+optim_obj += train_opt['ngram_loss_coeff'] * marginal_model['mean_ngram_loss']
 if args['unigram_reg']:
     optim_obj += train_model['mean_unigram_token_nll']
 optim_op, learning_rate = lm.create_optimizer(
@@ -202,6 +170,9 @@ optim_op, learning_rate = lm.create_optimizer(
 # dumping options for future reference
 reader_opt['text_path'] = data_path('___.txt')
 util.dump_opt(reader_opt, logger, name='reader_opt', fpath=exp_path('reader_opt.json'))
+util.dump_opt(
+    ngram_reader_opt, logger, name='ngram_reader_opt',
+    fpath=exp_path('ngram_reader_opt.json'))
 util.dump_opt(model_opt, logger, name='model_opt', fpath=exp_path('model_opt.json'))
 util.dump_opt(train_opt, logger, name='train_opt', fpath=exp_path('train_opt.json'))
 
@@ -214,9 +185,10 @@ sess_config = tf.ConfigProto(
     inter_op_parallelism_threads=4)
 sess = tf.Session(config=sess_config)
 sess.run(tf.global_variables_initializer())
-lm.train(
+lm.train_ngram_kl(
     train_opt, sess, train_model, optim_op, learning_rate,
-    train_iter_wrapper, eval_model, valid_iter_wrapper, logger)
+    train_iter_wrapper, eval_model, valid_iter_wrapper, logger,
+    marginal_model, ngram_iter_wrapper)
 
 reader_opt['text_path'] = data_path('test.txt')
 test_iter_wrapper = reader.get_batch_iter_from_file(

@@ -1,7 +1,21 @@
 import six
+import random
 import collections
 from functools import partial
 import numpy as np
+
+
+def read_ngram_lm(filepath, vocab):
+    ngram_data, logp_data = [], []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip().split('\t')
+            ngram = line[0].split(' ')
+            logp = float(line[1])
+            token_ids = vocab.w2i(ngram)
+            ngram_data.append(token_ids)
+            logp_data.append(logp)
+    return ngram_data, logp_data
 
 
 def read_ngrams(filepath, vocab):
@@ -120,10 +134,23 @@ def get_batch_iter(in_data, out_data, batch_size=1, shuffle=False):
         yield BatchTuple(features, labels, num_tokens)
 
 
+def get_ngram_batch_iter(in_data, out_data, batch_size=1, shuffle=False):
+    for x, y in _batch_iter(batch_size, shuffle, in_data, out_data, pad=[[], 0]):
+        x_arr, x_len = _hstack_list(x)
+        y_arr = np.array(y)
+        seq_weight = np.where(x_len > 0, 1, 0).astype(np.float32)
+        token_weight, num_tokens = _masked_full_like(
+            x_arr, 1, num_non_padding=x_len)
+        features = SeqFeatureTuple(x_arr, x_len)
+        labels = SeqLabelTuple(y_arr, token_weight, seq_weight)
+        yield BatchTuple(features, labels, num_tokens)
+
+
 def default_reader_opt():
     return {
         'vocab_path': 'test_data/vocab.txt',
         'text_path': 'test_data/train.txt',
+        'ngrams': False,
         'sentences': False,
         # if sentences is False
         'min_seq_len': 9,
@@ -142,7 +169,11 @@ def get_batch_iter_from_file(opt, vocab=None):
     if vocab is None:
         vocab = Vocabulary.from_vocab_file(opt['vocab_path'])
     _text_path = opt['text_path']
-    if opt['sentences']:
+    batch_fn = get_batch_iter
+    if opt['ngrams']:
+        in_data, out_data = read_ngram_lm(_text_path, vocab)
+        batch_fn = get_ngram_batch_iter
+    elif opt['sentences']:
         in_data, out_data = read_sentences(_text_path, vocab)
     else:
         in_data, out_data = read_text(
@@ -150,7 +181,7 @@ def get_batch_iter_from_file(opt, vocab=None):
     num_batches = np.ceil(len(in_data) / opt['batch_size'])
     keep_state = not (opt['shuffle'] or opt['sentences'])
     batch_iter = partial(
-            get_batch_iter,
+            batch_fn,
             in_data, out_data, batch_size=opt['batch_size'], shuffle=opt['shuffle'])
     return BatchIterWrapper(
         batch_iter, vocab, keep_state, opt['batch_size'], num_batches)

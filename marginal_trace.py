@@ -22,6 +22,7 @@ parser.add_argument('--batch_size', type=int, default=20)
 parser.add_argument('--num_trace_splits', type=int, default=1)
 parser.add_argument('--num_samples', type=int, default=10)
 parser.add_argument('--mini_sample_size', type=int, default=5)
+parser.add_argument('--random', action='store_true')
 parser.add_argument('--log_level', type=str, default='info')
 
 args = vars(parser.parse_args())
@@ -75,14 +76,12 @@ else:
     tf_trace_key = tf.constant(trace_key, dtype=tf.float32)
     tf_trace_scores = tf.matmul(tf_trace_q, tf_trace_key)
 tf_trace_log_scores = tf.nn.log_softmax(tf_trace_scores)
-tf_trace_choices = tf.multinomial(
-    tf_trace_scores, tf_trace_num, output_dtype=tf.int32)  # with replacement
 tf_cached_scores = tf.get_variable(
     'cached_trace_scores', shape=(args['batch_size'], trace_key.shape[-1]),
-    dtype=tf.float32, trainable=False)
+    dtype=tf.float32, trainable=False, initializer=tf.zeros_initializer())
 tf_update_cache = tf.assign(tf_cached_scores, tf_trace_scores)
 tf_cache_trace_choices = tf.multinomial(
-    tf_cached_scores, tf_trace_num, output_dtype=tf.int32)
+    tf_cached_scores, tf_trace_num, output_dtype=tf.int32)  # with replacement
 
 # running model
 sess_config = tf.ConfigProto(
@@ -115,14 +114,17 @@ for i in range(len(batches)):
 for batch in batches:
     _row_range = np.arange(len(batch))
     batch_input = batch.T
-    q_states = sess.run(
-        encoder['enc_cell_output'],
-        {encoder['full_seq']: batch_input,
-         model['batch_size']: len(batch),
-         model['seq_len_ph']: np.zeros((len(batch),))})
-    log_PZ, __ = sess.run(
-        [tf_trace_log_scores, tf_update_cache],
-        {tf_trace_q: np.squeeze(q_states, 0)})
+    if args['random']:
+        log_PZ = np.zeros((args['batch_size'], trace_key.shape[-1]), dtype=np.float32)
+    else:
+        q_states = sess.run(
+            encoder['enc_cell_output'],
+            {encoder['full_seq']: batch_input,
+             model['batch_size']: len(batch),
+             model['seq_len_ph']: np.zeros((len(batch),))})
+        log_PZ, __ = sess.run(
+            [tf_trace_log_scores, tf_update_cache],
+            {tf_trace_q: np.squeeze(q_states, 0)})
     choices = []
     for i_mini in range(args['num_samples'] // args['mini_sample_size']):
         choices.append(sess.run(
@@ -154,9 +156,12 @@ for batch in reader.get_batch_iter(in_data, out_data, batch_size=args['batch_siz
     feed_dict[model['token_weight_ph']] = batch.labels.label_weight
     feed_dict[model['seq_weight_ph']] = batch.labels.seq_weight
 
-    q_states = sess.run(encoder['enc_cell_output'], feed_dict)[0]  # enc runs backward
-    log_PZ, __ = sess.run(
-        [tf_trace_log_scores, tf_update_cache], {tf_trace_q: q_states})
+    if args['random']:
+        log_PZ = np.zeros((args['batch_size'], trace_key.shape[-1]), dtype=np.float32)
+    else:
+        q_states = sess.run(encoder['enc_cell_output'], feed_dict)[0]  # enc runs backward
+        log_PZ, __ = sess.run(
+            [tf_trace_log_scores, tf_update_cache], {tf_trace_q: q_states})
     choices = []
     for i_mini in range(args['num_samples'] // args['mini_sample_size']):
         choices.append(sess.run(
